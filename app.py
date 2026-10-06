@@ -7,6 +7,7 @@ from src.http_api import create_server
 from src.repository import Repository
 from src.rules import DomainRules
 from src.service import Service
+from src.sync import SyncService, SyncStore
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -18,6 +19,10 @@ def build_service(db_path: str) -> Service:
     repository = Repository(db_path)
     audit = AuditRecorder(repository)
     return Service(repository, DomainRules(), audit)
+
+
+def build_sync_service(db_path: str) -> SyncService:
+    return SyncService(SyncStore(db_path))
 
 
 def parse_args():
@@ -32,7 +37,8 @@ def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
     service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
+    sync_service = build_sync_service(args.db)
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", sync_service)
     print("跨海光缆故障与抢修协调 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()

@@ -12,9 +12,18 @@ from .domain import Actor, DomainError, PermissionDenied, ValidationError
 RECORD_RE = re.compile(r"^/api/records/(\d+)$")
 ACTION_RE = re.compile(r"^/api/records/(\d+)/actions/([a-z_]+)$")
 AUDIT_RE = re.compile(r"^/api/records/(\d+)/audit$")
+BATCH_REF_RE = re.compile(r"^/api/sync/batches/([^/]+)$")
+BATCH_RESUME_RE = re.compile(r"^/api/sync/batches/([^/]+)/resume$")
+CONFLICT_ID_RE = re.compile(r"^/api/sync/conflicts/(\d+)/resolve$")
+DEMAND_REF_RE = re.compile(r"^/api/sync/demands/([^/]+)$")
+DEMAND_PROMOTE_RE = re.compile(r"^/api/sync/demands/([^/]+)/promote$")
+ORDER_REF_RE = re.compile(r"^/api/sync/outbound/([^/]+)/(ship|cancel)$")
 
 
-def make_handler(service: Any, static_dir: Path):
+_NO_MATCH = object()
+
+
+def make_handler(service: Any, static_dir: Path, sync_service: Any = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "subsea-cable-repair/1.0"
 
@@ -65,7 +74,9 @@ def make_handler(service: Any, static_dir: Path):
             try:
                 parsed = urlparse(self.path)
                 if parsed.path == "/health":
-                    self._send(200, {"status": "ok", "service": "subsea-cable-repair", "database": service.repository.health()})
+                    self._send(200, {"status": "ok", "service": "subsea-cable-repair",
+                                     "database": service.repository.health(),
+                                     "sync_database": sync_service.health() if sync_service else False})
                     return
                 if parsed.path == "/":
                     page = (static_dir / "index.html").read_bytes()
@@ -87,14 +98,106 @@ def make_handler(service: Any, static_dir: Path):
                 if parsed.path == "/api/stats":
                     self._send(200, service.stats(self._actor()))
                     return
+                if sync_service is not None:
+                    response = self._sync_get(parsed)
+                    if response is not _NO_MATCH:
+                        self._send(200, response)
+                        return
                 self._send(404, {"error": "not_found", "message": "路径不存在"})
             except Exception as exc:
                 self._handle_error(exc)
+
+        def _sync_get(self, parsed) -> Any:
+            """返回匹配的响应对象，未匹配返回哨兵。同步子系统同样需要调用身份头。"""
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            self._actor()
+            if path == "/api/sync/batches":
+                return {"items": sync_service.list_batches(int(query.get("limit", ["100"])[0]))}
+            match = BATCH_REF_RE.match(path)
+            if match and not path.endswith("/resume"):
+                return sync_service.get_batch(match.group(1))
+            if path == "/api/sync/conflicts":
+                return {"items": sync_service.list_conflicts(query.get("state", [None])[0])}
+            if path == "/api/sync/demands":
+                return {"items": sync_service.list_demands(
+                    query.get("cable", [None])[0], query.get("segment", [None])[0],
+                    query.get("status", [None])[0])}
+            if path == "/api/sync/availability":
+                return sync_service.availability_view(
+                    query.get("cable", [None])[0], query.get("segment", [None])[0])
+            if path == "/api/sync/stock":
+                return {"items": sync_service.list_stock(query.get("warehouse", [None])[0])}
+            if path == "/api/sync/moves":
+                return {"items": sync_service.list_moves(query.get("warehouse", [None])[0])}
+            if path == "/api/sync/vessels":
+                return {"items": sync_service.list_vessels()}
+            if path == "/api/sync/spares":
+                return {"items": sync_service.list_spares()}
+            if path == "/api/sync/outbound":
+                return {"items": sync_service.list_outbound(query.get("demand_ref", [None])[0])}
+            if path == "/api/sync/reconcile":
+                return sync_service.reconcile()
+            match = DEMAND_REF_RE.match(path)
+            if match and not path.endswith("/promote"):
+                return sync_service.get_demand(match.group(1))
+            return _NO_MATCH
+
+        def _sync_post(self, parsed, body) -> tuple:
+            path = parsed.path
+            actor = self._actor()
+            actor_id = actor.user_id
+            if path == "/api/sync/batches":
+                items = body.get("items")
+                if items is None and isinstance(body.get("payload"), dict):
+                    items = body["payload"].get("items")
+                result = sync_service.submit_batch(
+                    actor_id, body.get("batch_ref", ""), body.get("node", ""),
+                    items or [], body.get("checksum"), body.get("payload"))
+                return (200 if result.get("idempotent_replay") else 201), result
+            match = BATCH_RESUME_RE.match(path)
+            if match:
+                return 200, sync_service.resume_batch(actor_id, match.group(1))
+            match = CONFLICT_ID_RE.match(path)
+            if match:
+                return 200, sync_service.resolve_conflict(actor_id, int(match.group(1)), body.get("resolution", body))
+            match = DEMAND_PROMOTE_RE.match(path)
+            if match:
+                return 200, sync_service.promote_draft(actor_id, match.group(1))
+            match = ORDER_REF_RE.match(path)
+            if match:
+                order_ref, verb = match.group(1), match.group(2)
+                if verb == "ship":
+                    return 200, sync_service.ship_outbound(actor_id, order_ref)
+                return 200, sync_service.cancel_outbound(actor_id, order_ref)
+            if path == "/api/sync/stock-moves":
+                result = sync_service.stock_move(
+                    actor_id, body.get("move_ref", ""), body.get("warehouse_id", ""),
+                    body.get("cable_type", ""), body.get("kind", ""),
+                    float(body.get("on_hand_delta", 0) or 0),
+                    float(body.get("in_transit_delta", 0) or 0), body.get("reason", ""))
+                return 201, result
+            if path == "/api/sync/outbound":
+                result = sync_service.issue_outbound(
+                    actor_id, body.get("order_ref", ""), body.get("demand_ref", ""),
+                    body.get("warehouse_id", ""), float(body.get("qty_km", 0)),
+                    float(body.get("amount", 0) or 0))
+                return 201, result
+            if path == "/api/sync/settlements":
+                result = sync_service.create_settlement(
+                    actor_id, body.get("entry_ref", ""), body.get("order_ref", ""),
+                    body.get("cable_type", ""), float(body.get("qty_km", 0)), float(body.get("amount", 0)))
+                return 201, result
+            return 404, {"error": "not_found", "message": "路径不存在"}
 
         def do_POST(self) -> None:
             try:
                 parsed = urlparse(self.path)
                 body = self._body()
+                if parsed.path.startswith("/api/sync/") and sync_service is not None:
+                    status_code, response = self._sync_post(parsed, body)
+                    self._send(status_code, response)
+                    return
                 if parsed.path == "/api/records":
                     record = service.create(self._actor(), body.get("reference", ""), body.get("data", {}))
                     self._send(201, record)
@@ -114,5 +217,5 @@ def make_handler(service: Any, static_dir: Path):
     return Handler
 
 
-def create_server(host: str, port: int, service: Any, static_dir: Path) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(service, static_dir))
+def create_server(host: str, port: int, service: Any, static_dir: Path, sync_service: Any = None) -> ThreadingHTTPServer:
+    return ThreadingHTTPServer((host, port), make_handler(service, static_dir, sync_service))
