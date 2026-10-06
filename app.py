@@ -4,6 +4,8 @@ from pathlib import Path
 
 from src.audit import AuditRecorder
 from src.http_api import create_server
+from src.logistics import LogisticsRules
+from src.logistics_service import LogisticsService
 from src.repository import Repository
 from src.rules import DomainRules
 from src.service import Service
@@ -14,10 +16,17 @@ DEFAULT_DB = BASE_DIR / "subsea-cable-repair.db"
 DEFAULT_PORT = 8330
 
 
-def build_service(db_path: str) -> Service:
+def build_services(db_path: str):
     repository = Repository(db_path)
     audit = AuditRecorder(repository)
-    return Service(repository, DomainRules(), audit)
+    rules = DomainRules()
+    service = Service(repository, rules, audit)
+    logistics = LogisticsService(repository, LogisticsRules(), rules)
+    return service, logistics
+
+
+def build_service(db_path: str) -> Service:
+    return build_services(db_path)[0]
 
 
 def parse_args():
@@ -31,8 +40,8 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     Path(args.db).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-    service = build_service(args.db)
-    server = create_server(args.host, args.port, service, BASE_DIR / "static")
+    service, logistics = build_services(args.db)
+    server = create_server(args.host, args.port, service, BASE_DIR / "static", logistics)
     print("跨海光缆故障与抢修协调 listening on http://%s:%s" % (args.host, args.port), flush=True)
     try:
         server.serve_forever()

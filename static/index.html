@@ -17,6 +17,7 @@
   <h1>跨海光缆故障与抢修协调</h1>
   <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
   <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+  <div class="row"><button id="batches">加载批次</button><button id="avail">查看现场可用量</button><button id="reconcile">出库对账</button></div>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
@@ -28,6 +29,9 @@ async function show(path) {
 }
 document.getElementById("load").onclick = () => show("/api/records?limit=20");
 document.getElementById("stats").onclick = () => show("/api/stats");
+document.getElementById("batches").onclick = () => show("/api/batches?limit=20");
+document.getElementById("avail").onclick = () => show("/api/inventory/availability?warehouse=WH-East&cable_type=LW-24");
+document.getElementById("reconcile").onclick = () => show("/api/reconcile");
 </script>
 </body>
 </html>
